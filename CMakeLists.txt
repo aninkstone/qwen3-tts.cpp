@@ -80,9 +80,11 @@ macro(inker_link_ggml_backend target_name)
             CUDA::cudart 
             CUDA::cublas 
             CUDA::cublasLt
+            CUDA::cuda_driver   # 💡 就是在这里加这一行！
         )
     endif()
 endmacro()
+
 # ========================================================================
 
 
