@@ -53,13 +53,14 @@ else()
     set(GGML_HAS_METAL OFF)
 endif()
 
-# 2. 探测 CUDA 后端 (Windows) - 💡 修改 2：专为 cors.dll 满血版打通链路
-if(EXISTS "${INKER_GGML_LIB_DIR}/ggml-cuda.lib")
+# 2. 接收外层指令开启 CUDA 后端 (Windows)
+if(GGML_CUDA)
     set(GGML_HAS_CUDA ON)
-    message(STATUS "[Inker Engine] GGML CUDA backend found — Nvidia GPU acceleration enabled")
+    message(STATUS "[Inker Engine] 🚀 GGML_CUDA 宏已接收 — Nvidia GPU 加速已强行启用！")
     find_package(CUDAToolkit REQUIRED)
 else()
     set(GGML_HAS_CUDA OFF)
+    message(STATUS "[Inker Engine] 🐢 未接收到 CUDA 宏，回落到 CPU 模式。")
 endif()
 
 # 3. 封装统一的 GGML 链接宏 (保持代码极致整洁) - 💡 修改 3

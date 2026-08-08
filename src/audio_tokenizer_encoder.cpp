@@ -7,21 +7,46 @@
 #include <algorithm>
 #include <numeric>
 
+// ========================================================================
+// PROFILER TOOL (Must be in global scope, strictly ASCII)
+// ========================================================================
+#include <chrono>
+#include <string>
+#include <iostream>
+
+class TimeProfiler {
+public:
+    TimeProfiler(const std::string& name) : mName(name) {
+        mStart = std::chrono::steady_clock::now();
+        std::cerr << "[Profiler] START -> [" << mName << "] Execution started..." << std::endl;
+    }
+    
+    ~TimeProfiler() {
+        auto end = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - mStart).count();
+        std::cerr << "[Profiler] END <- [" << mName << "] Execution completed! Duration: " << duration << " ms" << std::endl;
+    }
+private:
+    std::string mName;
+    std::chrono::steady_clock::time_point mStart;
+};
+
+#define INKER_PROFILE_SCOPE(name) TimeProfiler _profiler_##__LINE__(name)
+// ========================================================================
+
+
 #define QWEN3_TTS_MAX_NODES 16384
 
 namespace qwen3_tts {
 
 // Mel filterbank computation using librosa slaney normalization
-// This matches librosa.filters.mel with norm='slaney'
 static void compute_mel_filterbank_slaney(float * filterbank, int n_mels, int n_fft, 
                                            int sample_rate, float f_min, float f_max) {
-    // Slaney-style mel scale (used by librosa default)
     auto hz_to_mel_slaney = [](float hz) -> float {
-        // Linear below 1000 Hz, logarithmic above
-        const float f_sp = 200.0f / 3.0f;  // 66.67 Hz
+        const float f_sp = 200.0f / 3.0f;  
         const float min_log_hz = 1000.0f;
-        const float min_log_mel = (min_log_hz - 0.0f) / f_sp;  // 15
-        const float logstep = logf(6.4f) / 27.0f;  // log(6400/1000) / 27
+        const float min_log_mel = (min_log_hz - 0.0f) / f_sp;  
+        const float logstep = logf(6.4f) / 27.0f;  
         
         if (hz < min_log_hz) {
             return (hz - 0.0f) / f_sp;
@@ -48,13 +73,11 @@ static void compute_mel_filterbank_slaney(float * filterbank, int n_mels, int n_
     
     int n_fft_bins = n_fft / 2 + 1;
     
-    // Compute mel center frequencies
     std::vector<float> mel_points(n_mels + 2);
     for (int i = 0; i < n_mels + 2; ++i) {
         mel_points[i] = mel_min + (mel_max - mel_min) * i / (n_mels + 1);
     }
     
-    // Convert to Hz and then to FFT bin indices
     std::vector<float> hz_points(n_mels + 2);
     std::vector<float> fft_freqs(n_fft_bins);
     
@@ -68,13 +91,11 @@ static void compute_mel_filterbank_slaney(float * filterbank, int n_mels, int n_
     
     memset(filterbank, 0, n_mels * n_fft_bins * sizeof(float));
     
-    // Create triangular filters with slaney normalization
     for (int m = 0; m < n_mels; ++m) {
         float f_left = hz_points[m];
         float f_center = hz_points[m + 1];
         float f_right = hz_points[m + 2];
         
-        // Slaney normalization: divide by bandwidth (area normalization)
         float enorm = 2.0f / (f_right - f_left);
         
         for (int k = 0; k < n_fft_bins; ++k) {
@@ -93,31 +114,74 @@ static void compute_mel_filterbank_slaney(float * filterbank, int n_mels, int n_
     }
 }
 
-static void compute_dft(const float * input, float * real, float * imag, int n) {
-    for (int k = 0; k < n; ++k) {
-        real[k] = 0.0f;
-        imag[k] = 0.0f;
-        for (int t = 0; t < n; ++t) {
-            float angle = -2.0f * M_PI * k * t / n;
-            real[k] += input[t] * cosf(angle);
-            imag[k] += input[t] * sinf(angle);
+// ========================================================================
+// REPLACED: High-performance Cooley-Tukey FFT O(N log N) instead of O(N^2) DFT
+// ========================================================================
+static void compute_fft(const float * input, float * real, float * imag, int n) {
+    for (int i = 0; i < n; ++i) {
+        real[i] = input[i];
+        imag[i] = 0.0f;
+    }
+    
+    for (int i = 0, j = 0; i < n; ++i) {
+        if (i < j) {
+            float temp_r = real[i];
+            real[i] = real[j];
+            real[j] = temp_r;
+            
+            float temp_i = imag[i];
+            imag[i] = imag[j];
+            imag[j] = temp_i;
+        }
+        int bit = n >> 1;
+        for (; (bit & j) != 0; bit >>= 1) {
+            j ^= bit;
+        }
+        j ^= bit;
+    }
+    
+    for (int len = 2; len <= n; len <<= 1) {
+        float ang = -2.0f * M_PI / len;
+        float wlen_cos = cosf(ang);
+        float wlen_sin = sinf(ang);
+        for (int i = 0; i < n; i += len) {
+            float w_cos = 1.0f;
+            float w_sin = 0.0f;
+            for (int j = 0; j < len / 2; ++j) {
+                int idx1 = i + j;
+                int idx2 = i + j + len / 2;
+                
+                float u_real = real[idx1];
+                float u_imag = imag[idx1];
+                
+                float v_real = real[idx2] * w_cos - imag[idx2] * w_sin;
+                float v_imag = real[idx2] * w_sin + imag[idx2] * w_cos;
+                
+                real[idx1] = u_real + v_real;
+                imag[idx1] = u_imag + v_imag;
+                
+                real[idx2] = u_real - v_real;
+                imag[idx2] = u_imag - v_imag;
+                
+                float next_w_cos = w_cos * wlen_cos - w_sin * wlen_sin;
+                float next_w_sin = w_cos * wlen_sin + w_sin * wlen_cos;
+                w_cos = next_w_cos;
+                w_sin = next_w_sin;
+            }
         }
     }
 }
 
-// Periodic Hann window (matches torch.hann_window with periodic=True, which is default)
+// Periodic Hann window
 static void compute_hann_window(float * window, int n) {
     for (int i = 0; i < n; ++i) {
         window[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / n));
     }
 }
 
-// Compute centered window for STFT (PyTorch centers win_length window in n_fft frame)
+// Compute centered window for STFT
 static void compute_centered_window(float * window, int n_fft, int win_length) {
-    // Zero-initialize
     memset(window, 0, n_fft * sizeof(float));
-    
-    // Compute Hann window of win_length
     int offset = (n_fft - win_length) / 2;
     for (int i = 0; i < win_length; ++i) {
         window[offset + i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / win_length));
@@ -289,29 +353,27 @@ bool AudioTokenizerEncoder::compute_mel_spectrogram(const float * samples, int32
                                                      std::vector<float> & mel, int32_t & n_frames) {
     const auto & cfg = model_.config;
     
-    // Match PyTorch STFT padding: (n_fft - hop_size) // 2 on each side with reflect
     int padding = (cfg.n_fft - cfg.hop_length) / 2;
     int padded_length = n_samples + 2 * padding;
     
-    // Create padded signal with reflect padding
     std::vector<float> padded(padded_length);
     for (int i = 0; i < padded_length; ++i) {
-        int src_idx;
+        int src_idx = 0;
         if (i < padding) {
-            // Reflect left: padding-1, padding-2, ..., 0 -> samples[padding-i], samples[padding-1-i], ...
             src_idx = padding - i;
-        } else if (i >= padding + n_samples) {
-            // Reflect right
-            src_idx = 2 * n_samples - (i - padding) - 2;
-        } else {
-            src_idx = i - padding;
+        } 
+        else {
+            if (i >= padding + n_samples) {
+                src_idx = 2 * n_samples - (i - padding) - 2;
+            } 
+            else {
+                src_idx = i - padding;
+            }
         }
-        // Clamp to valid range
         src_idx = std::max(0, std::min(n_samples - 1, src_idx));
         padded[i] = samples[src_idx];
     }
     
-    // With center=False, frames start at 0 and step by hop_length
     n_frames = (padded_length - cfg.n_fft) / cfg.hop_length + 1;
     if (n_frames <= 0) {
         error_msg_ = "Audio too short for mel spectrogram";
@@ -324,45 +386,36 @@ bool AudioTokenizerEncoder::compute_mel_spectrogram(const float * samples, int32
     compute_mel_filterbank_slaney(filterbank.data(), cfg.n_mels, cfg.n_fft, 
                                    cfg.sample_rate, cfg.f_min, cfg.f_max);
     
-    // PyTorch STFT with win_length < n_fft centers the window in the n_fft frame
-    // This is critical for matching PyTorch's output
     std::vector<float> window(cfg.n_fft);
     compute_centered_window(window.data(), cfg.n_fft, cfg.win_length);
     
-    // Output: [batch, n_mels, n_frames] but we store as [n_mels, n_frames] row-major
-    // which means mel[m * n_frames + f] = value at mel bin m, frame f
     mel.resize(cfg.n_mels * n_frames);
     
-    std::vector<float> frame(cfg.n_fft, 0.0f);
-    std::vector<float> fft_real(cfg.n_fft);
-    std::vector<float> fft_imag(cfg.n_fft);
-    std::vector<float> magnitude(n_fft_bins);
-    
+    // OpenMP parallelized frame-by-frame loop with local thread buffers
+    #pragma omp parallel for schedule(dynamic)
     for (int32_t f = 0; f < n_frames; ++f) {
         int start = f * cfg.hop_length;
         
-        // Apply centered window to n_fft samples
+        std::vector<float> local_frame(cfg.n_fft, 0.0f);
+        std::vector<float> local_fft_real(cfg.n_fft);
+        std::vector<float> local_fft_imag(cfg.n_fft);
+        std::vector<float> local_magnitude(n_fft_bins);
+        
         for (int i = 0; i < cfg.n_fft; ++i) {
-            frame[i] = padded[start + i] * window[i];
+            local_frame[i] = padded[start + i] * window[i];
         }
         
-        compute_dft(frame.data(), fft_real.data(), fft_imag.data(), cfg.n_fft);
+        compute_fft(local_frame.data(), local_fft_real.data(), local_fft_imag.data(), cfg.n_fft);
         
-        // Compute magnitude (not power) - matches torch.stft with return_complex=True then abs()
-        // spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
         for (int k = 0; k < n_fft_bins; ++k) {
-            magnitude[k] = sqrtf(fft_real[k] * fft_real[k] + fft_imag[k] * fft_imag[k] + 1e-9f);
+            local_magnitude[k] = sqrtf(local_fft_real[k] * local_fft_real[k] + local_fft_imag[k] * local_fft_imag[k] + 1e-9f);
         }
         
-        // Apply mel filterbank and log compression
-        // mel_spec = torch.matmul(mel_basis, spec)
-        // mel_spec = dynamic_range_compression_torch(mel_spec)  # log(clamp(x, min=1e-5) * 1)
         for (int m = 0; m < cfg.n_mels; ++m) {
             float sum = 0.0f;
             for (int k = 0; k < n_fft_bins; ++k) {
-                sum += filterbank[m * n_fft_bins + k] * magnitude[k];
+                sum += filterbank[m * n_fft_bins + k] * local_magnitude[k];
             }
-            // dynamic_range_compression: log(clamp(x, min=1e-5))
             mel[m * n_frames + f] = logf(std::max(sum, 1e-5f));
         }
     }
@@ -457,16 +510,10 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
     struct ggml_context * ctx0 = ggml_init(params);
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
     
-     // Input: mel spectrogram [n_mels, n_frames] - stored as [n_mels, n_frames] row-major
-     // GGML uses column-major, so this is [n_frames, n_mels] in GGML notation
      struct ggml_tensor * mel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_frames, cfg.n_mels);
      ggml_set_name(mel, "mel");
      ggml_set_input(mel);
      
-     // PyTorch: hidden_states = hidden_states.transpose(1, 2)  # [B, T, C] -> [B, C, T]
-     // Our mel is [n_frames, n_mels] in GGML = [n_mels, n_frames] row-major
-     // For conv1d, we need [T, C, B] in GGML = [B, C, T] row-major
-     // So reshape to [n_frames, n_mels, 1]
      struct ggml_tensor * cur = ggml_reshape_3d(ctx0, mel, n_frames, cfg.n_mels, 1);
      ggml_set_name(cur, "mel_3d");
      
@@ -486,12 +533,9 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
     
     int64_t seq_len = cur->ne[0];
     
-    // Store block outputs for MFA (including block 0)
     struct ggml_tensor * block_outputs[4];
-    block_outputs[0] = cur;  // Initial TDNN output
+    block_outputs[0] = cur;  
     
-    // Blocks 1-3: SE-Res2Net blocks
-    // Dilations: block1=2, block2=3, block3=4
     int dilations[3] = {2, 3, 4};
     
     for (int blk = 0; blk < 3; ++blk) {
@@ -506,22 +550,9 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
              ggml_set_name(cur, "blk1_tdnn1");
          }
         
-        // Res2Net: Split into 8 branches of 64 channels each
-        // cur shape: [seq_len, 512, 1]
-        // Branch 0: identity (no conv)
-        // Branch i (1-7): conv(hidden_part + previous_output) for i >= 2, conv(hidden_part) for i == 1
-        
-        // Split channels: view as [seq_len, 64, 8] then split
         struct ggml_tensor * branches[8];
         
-        // Extract each branch using view operations
-        // cur is [seq_len, 512, 1], we want to split dim 1 into 8 parts of 64
         for (int b = 0; b < scale; ++b) {
-            // View into the b-th chunk of 64 channels
-            // cur shape: [seq_len, 512, 1], we want [seq_len, 64, 1] starting at channel b*64
-            // nb1 = stride for dim 1 = cur->nb[1] (bytes to move from one channel to next)
-            // nb2 = stride for dim 2 = cur->nb[2] (bytes to move from one batch to next)
-            // offset = b * 64 * cur->nb[1] (skip b*64 channels)
             branches[b] = ggml_view_3d(ctx0, cur, 
                                         seq_len, branch_dim, 1,
                                         cur->nb[1], cur->nb[2], 
@@ -529,27 +560,23 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
             branches[b] = ggml_cont(ctx0, branches[b]);
         }
         
-        // Process branches according to Res2Net logic
         struct ggml_tensor * outputs[8];
-        outputs[0] = branches[0];  // Branch 0: identity
+        outputs[0] = branches[0];  
         
         for (int b = 1; b < scale; ++b) {
             struct ggml_tensor * input;
             if (b == 1) {
                 input = branches[b];
             } else {
-                // Add previous output to current branch
                 input = ggml_add(ctx0, branches[b], outputs[b - 1]);
             }
             
-            // Apply conv with dilation (kernel=3)
-            // Padding for kernel=3, dilation=d: pad = d * (3-1) / 2 = d
             if (block.res2net_w[b - 1]) {
                 outputs[b] = apply_conv1d(ctx0, block.res2net_w[b - 1], block.res2net_b[b - 1], 
                                           input, 1, dilation, dilation);
                 outputs[b] = ggml_relu(ctx0, outputs[b]);
             } else {
-                outputs[b] = input;  // Fallback if weight missing
+                outputs[b] = input;  
             }
         }
         
@@ -572,16 +599,12 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
              ggml_set_name(cur, "blk1_tdnn2");
          }
          
-         // SE (Squeeze-Excitation)
-         // Global average pooling over time: mean(dim=2, keepdim=True)
          struct ggml_tensor * se = ggml_pool_1d(ctx0, cur, GGML_OP_POOL_AVG, seq_len, seq_len, 0);
          se = ggml_reshape_3d(ctx0, se, 1, hidden_dim, 1);
          
-         // SE conv1: 512 -> 128 with ReLU
          se = apply_conv1d(ctx0, block.se_conv1_w, block.se_conv1_b, se, 1, 0, 1);
          se = ggml_relu(ctx0, se);
          
-         // SE conv2: 128 -> 512 with Sigmoid
          se = apply_conv1d(ctx0, block.se_conv2_w, block.se_conv2_b, se, 1, 0, 1);
          se = ggml_sigmoid(ctx0, se);
          
@@ -599,28 +622,17 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
         block_outputs[blk + 1] = cur;
     }
     
-     // MFA: Concatenate block outputs [1:] (blocks 1, 2, 3 = indices 1, 2, 3)
-     // hidden_states = torch.cat(hidden_states_list[1:], dim=1)
-     // Each block output is [seq_len, 512, 1]
-     // Concatenated: [seq_len, 1536, 1]
      struct ggml_tensor * mfa_input = ggml_concat(ctx0, block_outputs[1], block_outputs[2], 1);
      mfa_input = ggml_concat(ctx0, mfa_input, block_outputs[3], 1);
      ggml_set_name(mfa_input, "mfa_input");
      
-     // MFA conv: 1536 -> 1536 with ReLU
      cur = apply_conv1d(ctx0, model_.mfa_w, model_.mfa_b, mfa_input, 1, 0, 1);
      cur = ggml_relu(ctx0, cur);
      ggml_set_name(cur, "mfa_out");
     
-    // ASP (Attentive Statistics Pooling)
-    // cur shape: [seq_len, 1536, 1]
-    
-    // Step 1: Compute global mean and std over time
-    // mean = hidden_states.mean(dim=2, keepdim=True)  # [1, 1536, 1]
     struct ggml_tensor * global_mean = ggml_pool_1d(ctx0, cur, GGML_OP_POOL_AVG, seq_len, seq_len, 0);
     global_mean = ggml_reshape_3d(ctx0, global_mean, 1, 1536, 1);
     
-    // std = sqrt(E[x^2] - E[x]^2)
     struct ggml_tensor * sq = ggml_sqr(ctx0, cur);
     struct ggml_tensor * mean_sq = ggml_pool_1d(ctx0, sq, GGML_OP_POOL_AVG, seq_len, seq_len, 0);
     mean_sq = ggml_reshape_3d(ctx0, mean_sq, 1, 1536, 1);
@@ -628,10 +640,6 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
     var = ggml_clamp(ctx0, var, 1e-12f, 1e10f);
     struct ggml_tensor * global_std = ggml_sqrt(ctx0, var);
     
-    // Step 2: Expand mean and std to full sequence length and concatenate with hidden_states
-    // mean = mean.repeat(1, 1, seq_length)  # [1, 1536, seq_len]
-    // std = std.repeat(1, 1, seq_length)    # [1, 1536, seq_len]
-    // attention = torch.cat([hidden_states, mean, std], dim=1)  # [1, 4608, seq_len]
     struct ggml_tensor * mean_expanded = ggml_repeat(ctx0, global_mean, 
                                                       ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, seq_len, 1536, 1));
     struct ggml_tensor * std_expanded = ggml_repeat(ctx0, global_std,
@@ -639,55 +647,40 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
     
     struct ggml_tensor * attention = ggml_concat(ctx0, cur, mean_expanded, 1);
     attention = ggml_concat(ctx0, attention, std_expanded, 1);
-    // attention shape: [seq_len, 4608, 1]
     
-     // Step 3: TDNN (4608 -> 128) with ReLU, then Tanh
-     // self.tdnn = TimeDelayNetBlock(channels * 3, attention_channels, 1, 1)  # has ReLU
-     // attention = self.conv(self.tanh(self.tdnn(attention)))
      attention = apply_conv1d(ctx0, model_.asp_tdnn_w, model_.asp_tdnn_b, attention, 1, 0, 1);
-     attention = ggml_relu(ctx0, attention);  // TDNN has ReLU
+     attention = ggml_relu(ctx0, attention);  
      ggml_set_name(attention, "asp_tdnn");
-     attention = ggml_tanh(ctx0, attention);  // Then tanh is applied
+     attention = ggml_tanh(ctx0, attention);  
      
-     // Step 4: Conv (128 -> 1536) for attention weights
-     // self.conv = nn.Conv1d(attention_channels, channels, kernel_size=1)
      attention = apply_conv1d(ctx0, model_.asp_conv_w, model_.asp_conv_b, attention, 1, 0, 1);
      ggml_set_name(attention, "asp_conv");
-     // attention shape: [seq_len, 1536, 1]
      
-     // Step 5: Softmax over time dimension
      attention = ggml_soft_max(ctx0, attention);
      ggml_set_name(attention, "asp_softmax");
     
-    // Step 6: Compute weighted mean and std
-    // mean, std = self._compute_statistics(hidden_states, attention)
-    // mean = (attention * hidden_states).sum(dim=2)
     struct ggml_tensor * weighted = ggml_mul(ctx0, attention, cur);
     struct ggml_tensor * weighted_mean = ggml_pool_1d(ctx0, weighted, GGML_OP_POOL_AVG, seq_len, seq_len, 0);
-    weighted_mean = ggml_scale(ctx0, weighted_mean, (float)seq_len);  // Convert avg to sum
+    weighted_mean = ggml_scale(ctx0, weighted_mean, (float)seq_len);  
     weighted_mean = ggml_reshape_3d(ctx0, weighted_mean, 1, 1536, 1);
     
-    // std = sqrt((attention * (hidden_states - mean)^2).sum(dim=2).clamp(eps))
     struct ggml_tensor * mean_for_std = ggml_repeat(ctx0, weighted_mean,
                                                      ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, seq_len, 1536, 1));
     struct ggml_tensor * diff = ggml_sub(ctx0, cur, mean_for_std);
     struct ggml_tensor * diff_sq = ggml_sqr(ctx0, diff);
     struct ggml_tensor * weighted_var = ggml_mul(ctx0, attention, diff_sq);
     struct ggml_tensor * var_sum = ggml_pool_1d(ctx0, weighted_var, GGML_OP_POOL_AVG, seq_len, seq_len, 0);
-    var_sum = ggml_scale(ctx0, var_sum, (float)seq_len);  // Convert avg to sum
+    var_sum = ggml_scale(ctx0, var_sum, (float)seq_len);  
     var_sum = ggml_reshape_3d(ctx0, var_sum, 1, 1536, 1);
     var_sum = ggml_clamp(ctx0, var_sum, 1e-12f, 1e10f);
     struct ggml_tensor * weighted_std = ggml_sqrt(ctx0, var_sum);
     
-     // Step 7: Concatenate mean and std: [1, 3072, 1]
      struct ggml_tensor * pooled = ggml_concat(ctx0, weighted_mean, weighted_std, 1);
      ggml_set_name(pooled, "asp_pooled");
      
-     // FC: 3072 -> 1024
      cur = apply_conv1d(ctx0, model_.fc_w, model_.fc_b, pooled, 1, 0, 1);
      ggml_set_name(cur, "fc_out");
     
-    // Squeeze to 1D
     cur = ggml_reshape_1d(ctx0, cur, cfg.embedding_dim);
     
     ggml_set_name(cur, "embedding");
@@ -709,15 +702,23 @@ bool AudioTokenizerEncoder::encode(const float * samples, int32_t n_samples,
     
     std::vector<float> mel;
     int32_t n_frames;
-    if (!compute_mel_spectrogram(samples, n_samples, mel, n_frames)) {
-        return false;
+    
+    {
+        INKER_PROFILE_SCOPE("Encoder Stage 1: compute_mel_spectrogram");
+        if (!compute_mel_spectrogram(samples, n_samples, mel, n_frames)) {
+            return false;
+        }
     }
     
-    struct ggml_cgraph * gf = build_graph(n_frames);
+    struct ggml_cgraph * gf = nullptr;
+    {
+        INKER_PROFILE_SCOPE("Encoder Stage 2: build_graph and alloc");
+        gf = build_graph(n_frames);
 
-    if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
-        error_msg_ = "Failed to allocate graph";
-        return false;
+        if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+            error_msg_ = "Failed to allocate graph";
+            return false;
+        }
     }
     
     struct ggml_tensor * mel_tensor = ggml_graph_get_tensor(gf, "mel");
@@ -727,18 +728,18 @@ bool AudioTokenizerEncoder::encode(const float * samples, int32_t n_samples,
         return false;
     }
     
-    // mel is stored as [n_mels, n_frames] row-major: mel[m * n_frames + f] = mel bin m at frame f
-    // GGML tensor is [n_frames, n_mels] column-major: element (f, m) at memory[f + m * n_frames]
-    // For GGML conv1d, we want input(t, c) = mel bin c at time t
-    // So GGML memory[t + c * n_frames] should equal mel[c * n_frames + t]
-    // Since the memory layout matches (both are contiguous in frame order for each mel bin),
-    // we can copy directly!
-    ggml_backend_tensor_set(mel_tensor, mel.data(), 0, mel.size() * sizeof(float));
+    {
+        INKER_PROFILE_SCOPE("Encoder Stage 3: Tensor Set (RAM to GPU)");
+        ggml_backend_tensor_set(mel_tensor, mel.data(), 0, mel.size() * sizeof(float));
+    }
     
-    if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
-        error_msg_ = "Failed to compute graph";
-        ggml_backend_sched_reset(state_.sched);
-        return false;
+    {
+        INKER_PROFILE_SCOPE("Encoder Stage 4: graph_compute");
+        if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+            error_msg_ = "Failed to compute graph";
+            ggml_backend_sched_reset(state_.sched);
+            return false;
+        }
     }
 
     struct ggml_tensor * emb_tensor = ggml_graph_get_tensor(gf, "embedding");
@@ -749,7 +750,10 @@ bool AudioTokenizerEncoder::encode(const float * samples, int32_t n_samples,
     }
     
     embedding.resize(model_.config.embedding_dim);
-    ggml_backend_tensor_get(emb_tensor, embedding.data(), 0, embedding.size() * sizeof(float));
+    {
+        INKER_PROFILE_SCOPE("Encoder Stage 5: Tensor Get (GPU to RAM)");
+        ggml_backend_tensor_get(emb_tensor, embedding.data(), 0, embedding.size() * sizeof(float));
+    }
     
     ggml_backend_sched_reset(state_.sched);
     
