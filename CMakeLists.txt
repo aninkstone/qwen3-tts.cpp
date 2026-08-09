@@ -252,3 +252,6 @@ add_test(NAME decoder_test
     COMMAND test_decoder
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+add_executable(qwen3_tts_quantize src/quantize_tts.cpp)
+inker_link_ggml_backend(qwen3_tts_quantize)

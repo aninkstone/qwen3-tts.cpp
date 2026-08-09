@@ -728,6 +728,11 @@ bool TTSTransformer::init_kv_cache(int32_t n_ctx) {
         error_msg_ = "Failed to allocate KV cache buffer";
         return false;
     }
+
+    // Measure and log the actual VRAM allocation for the KV Cache
+    size_t cache_size_bytes = ggml_backend_buffer_get_size(state_.cache.buffer);
+    double cache_size_mb = (double)cache_size_bytes / (1024.0 * 1024.0);
+    fprintf(stderr, "🧠 [Memory LOG] Base KV Cache allocated: n_ctx = %d, VRAM Usage = %.2f MB\n", n_ctx, cache_size_mb);
     
     return true;
 }
@@ -782,6 +787,11 @@ bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
         error_msg_ = "Failed to allocate code predictor KV cache buffer";
         return false;
     }
+
+    // Measure and log the actual VRAM allocation for the Code Predictor KV Cache
+    size_t cache_size_bytes = ggml_backend_buffer_get_size(state_.code_pred_cache.buffer);
+    double cache_size_mb = (double)cache_size_bytes / (1024.0 * 1024.0);
+    fprintf(stderr, "🧠 [Memory LOG] Predictor KV Cache allocated: n_ctx = %d, VRAM Usage = %.2f MB\n", n_ctx, cache_size_mb);
     
     return true;
 }
@@ -2627,7 +2637,17 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     const int32_t prefill_len = (int32_t)(prefill_embd.size() / cfg.hidden_size);
     const int32_t trailing_len = (int32_t)(trailing_text_hidden.size() / cfg.hidden_size);
 
-    const int32_t required_ctx = prefill_len + max_len + 8;
+    // Core VRAM optimization: Dynamic N_CTX elastic allocation
+    // The max_len passed from frontend JS is 8192 (fallback). If we allocate based on 8192 directly, 
+    // it will instantly consume 1.2GB of blank cache.
+    // We dynamically calculate the required audio tokens based on the actual number of text_tokens.
+    // 1 text token usually corresponds to 3~6 audio tokens. We relax this to 15 times + 300 for an absolute safety margin.
+    int32_t dynamic_max_len = std::min<int32_t>(max_len, n_tokens * 15 + 300);
+
+    const int32_t required_ctx = prefill_len + dynamic_max_len + 8;
+    
+    // VRAM pool elastic recovery mechanism: Not only scale up on demand, but also force shrink to return VRAM 
+    // to the desktop system when the idle rate of the VRAM pool is too high (> 2 times).
     if (state_.cache.n_ctx < required_ctx || state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
         if (!init_kv_cache(required_ctx)) {
             return false;
@@ -2650,7 +2670,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #endif
     
     output.clear();
-    output.reserve(max_len * cfg.n_codebooks);
+    // Use dynamic length to pre-allocate output array, further saving memory
+    output.reserve((size_t)dynamic_max_len * cfg.n_codebooks);
     
     int32_t n_past = prefill_len;
     std::vector<int32_t> frame_codes(cfg.n_codebooks);
@@ -2661,21 +2682,20 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     std::vector<float> step_embd(cfg.hidden_size, 0.0f);
     std::vector<float> embd_row(cfg.hidden_size);
     
-    for (int frame = 0; frame < max_len; ++frame) {
-        // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
+    for (int frame = 0; frame < dynamic_max_len; ++frame) {
         for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
             if (i != cfg.codec_eos_id) {
                 logits[i] = -INFINITY;
             }
         }
 
-        // Repetition penalty (HuggingFace style) on previously generated CB0 tokens
         if (repetition_penalty != 1.0f) {
             for (int32_t tok : generated_cb0_tokens) {
                 if (tok >= 0 && tok < cfg.codec_vocab_size) {
                     if (logits[tok] > 0.0f) {
                         logits[tok] /= repetition_penalty;
-                    } else {
+                    } 
+                    else {
                         logits[tok] *= repetition_penalty;
                     }
                 }
@@ -2685,7 +2705,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         int32_t next_token;
         if (temperature <= 0.0f) {
             next_token = argmax(logits.data(), cfg.codec_vocab_size);
-        } else {
+        } 
+        else {
             for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
                 logits[i] /= temperature;
             }
@@ -2752,7 +2773,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         timing.n_frames = frame + 1;
 #endif
 
-        if (frame + 1 >= max_len) {
+        if (frame + 1 >= dynamic_max_len) {
             break;
         }
 
@@ -2785,6 +2806,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         const float * trailing_row = (frame < trailing_len)
             ? trailing_text_hidden.data() + (size_t)frame * cfg.hidden_size
             : tts_pad_embed.data();
+            
         for (int32_t h = 0; h < cfg.hidden_size; ++h) {
             step_embd[h] += trailing_row[h];
         }
@@ -2808,6 +2830,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     timing_ = nullptr;
     const auto & t = timing;
     int nf = t.n_frames;
+    
     fprintf(stderr, "\n=== Detailed Generation Timing (%d frames) ===\n", nf);
     fprintf(stderr, "\n  Prefill:\n");
     fprintf(stderr, "    Build graph:      %8.1f ms\n", t.t_prefill_build_ms);
@@ -2816,12 +2839,14 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     fprintf(stderr, "      Graph alloc:    %8.1f ms\n", t.t_prefill_graph_alloc_ms);
     fprintf(stderr, "      Compute:        %8.1f ms\n", t.t_prefill_compute_ms);
     fprintf(stderr, "      Data I/O:       %8.1f ms\n", t.t_prefill_data_ms);
+    
     fprintf(stderr, "\n  Talker forward_step (total / per-frame):\n");
     fprintf(stderr, "    Total:            %8.1f ms   (%.1f ms/frame)\n", t.t_talker_forward_ms, nf > 0 ? t.t_talker_forward_ms / nf : 0.0);
     fprintf(stderr, "      Graph build:    %8.1f ms   (%.1f ms/frame)\n", t.t_talker_graph_build_ms, nf > 0 ? t.t_talker_graph_build_ms / nf : 0.0);
     fprintf(stderr, "      Graph alloc:    %8.1f ms   (%.1f ms/frame)\n", t.t_talker_graph_alloc_ms, nf > 0 ? t.t_talker_graph_alloc_ms / nf : 0.0);
     fprintf(stderr, "      Compute:        %8.1f ms   (%.1f ms/frame)\n", t.t_talker_compute_ms, nf > 0 ? t.t_talker_compute_ms / nf : 0.0);
     fprintf(stderr, "      Data I/O:       %8.1f ms   (%.1f ms/frame)\n", t.t_talker_data_ms, nf > 0 ? t.t_talker_data_ms / nf : 0.0);
+    
     fprintf(stderr, "\n  Code predictor (total / per-frame):\n");
     fprintf(stderr, "    Backend:          %s\n", use_coreml_code_predictor_ ? "CoreML (CPU+NE)" : "GGML");
     if (use_coreml_code_predictor_ && !coreml_code_predictor_path_.empty()) {
@@ -2836,6 +2861,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     fprintf(stderr, "      Compute:        %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_compute_ms, nf > 0 ? t.t_code_pred_compute_ms / nf : 0.0);
     fprintf(stderr, "      Data I/O:       %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_data_ms, nf > 0 ? t.t_code_pred_data_ms / nf : 0.0);
     fprintf(stderr, "      CoreML total:   %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_coreml_ms, nf > 0 ? t.t_code_pred_coreml_ms / nf : 0.0);
+    
     fprintf(stderr, "\n  Embed lookups:      %8.1f ms   (%.1f ms/frame)\n", t.t_embed_lookup_ms, nf > 0 ? t.t_embed_lookup_ms / nf : 0.0);
     double accounted = t.t_prefill_build_ms + t.t_prefill_forward_ms + t.t_talker_forward_ms + t.t_code_pred_ms + t.t_embed_lookup_ms;
     fprintf(stderr, "  Other/overhead:     %8.1f ms\n", t.t_generate_total_ms - accounted);
