@@ -11,6 +11,8 @@
 
 namespace qwen3_tts {
 
+void set_primary_gpu(int gpu_id);
+
 // Generic GGUF model loader class
 // This is a simplified loader that can be extended for specific model types
 class GGUFLoader {

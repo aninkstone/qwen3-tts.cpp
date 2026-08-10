@@ -15,6 +15,12 @@
 
 namespace qwen3_tts {
 
+static int g_main_gpu = 0;
+
+void set_primary_gpu(int gpu_id) {
+    g_main_gpu = gpu_id;
+}
+
 namespace {
 struct shared_backend_state {
     ggml_backend_t backend = nullptr;
@@ -28,7 +34,7 @@ shared_backend_state & get_shared_backend_state() {
 
 ggml_backend_t init_tensor_loader_backend(enum ggml_backend_dev_type preferred_backend_type) {
 #ifdef GGML_USE_CUDA
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = ggml_backend_cuda_init(g_main_gpu);
     if (backend != nullptr) {
         return backend;
     }
@@ -59,7 +65,7 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
 // Force CUDA init
 #ifdef GGML_USE_CUDA
     fprintf(stderr, "[Inker Engine] Forcing ggml_backend_cuda_init(0) for %s ...\n", component_name != nullptr ? component_name : "component");
-    backend = ggml_backend_cuda_init(0);
+    backend = ggml_backend_cuda_init(g_main_gpu);
     
     if (backend != nullptr) {
         fprintf(stderr, "[Inker Engine] CUDA init success!\n");
